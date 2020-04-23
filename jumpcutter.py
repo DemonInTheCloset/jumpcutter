@@ -1,22 +1,21 @@
-from contextlib import closing
-from PIL import Image
-import subprocess
+from argparse import ArgumentParser
+from math import ceil
+from os import mkdir, path, rename
+from re import search
+from shutil import copyfile, rmtree
+from subprocess import call
+
+import numpy as np
 from audiotsm import phasevocoder
 from audiotsm.io.wav import WavReader, WavWriter
-from scipy.io import wavfile
-import numpy as np
-import re
-import math
-from shutil import copyfile, rmtree
-import os
-import argparse
 from pytube import YouTube
+from scipy.io import wavfile
 
 
 def download_file(url):
     name = YouTube(url).streams.first().download()
     new_name = name.replace(' ', '_')
-    os.rename(name, new_name)
+    rename(name, new_name)
     return new_name
 
 
@@ -29,7 +28,7 @@ def get_max_volume(s):
 def copy_frame(input_frame, output_frame):
     src = TEMP_FOLDER + "/frame{:06d}".format(input_frame + 1) + ".jpg"
     dst = TEMP_FOLDER + "/newFrame{:06d}".format(output_frame + 1) + ".jpg"
-    if not os.path.isfile(src):
+    if not path.isfile(src):
         return False
     copyfile(src, dst)
     if output_frame % 20 == 19:
@@ -46,7 +45,7 @@ def create_path(s):
     # assert (not os.path.exists(s)), "The filepath "+s+" already exists. Don't want to overwrite it. Aborting."
 
     try:
-        os.mkdir(s)
+        mkdir(s)
     except OSError:
         assert False, "Creation of the directory %s failed. (The TEMP folder may already exist. Delete or rename it, and try again.)"
 
@@ -59,156 +58,181 @@ def delete_path(s):  # Dangerous! Watch out!
         print(OSError)
 
 
-parser = argparse.ArgumentParser(
-    description='Modifies a video file to play at different speeds when there is sound vs. silence.')
-parser.add_argument('--input_file', type=str, help='the video file you want modified')
-parser.add_argument('--url', type=str, help='A youtube url to download and process')
-parser.add_argument('--output_file', type=str, default="",
-                    help="the output file. (optional. if not included, it'll just modify the input file name)")
-parser.add_argument('--silent_threshold', type=float, default=0.03,
-                    help="the volume amount that frames' audio needs to surpass to be consider \"sounded\". It ranges from 0 (silence) to 1 (max volume)")
-parser.add_argument('--sounded_speed', type=float, default=1.00,
-                    help="the speed that sounded (spoken) frames should be played at. Typically 1.")
-parser.add_argument('--silent_speed', type=float, default=5.00,
-                    help="the speed that silent frames should be played at. 999999 for jumpcutting.")
-parser.add_argument('--frame_margin', type=float, default=1,
-                    help="some silent frames adjacent to sounded frames are included to provide context. How many frames on either the side of speech should be included? That's this variable.")
-parser.add_argument('--sample_rate', type=float, default=44100, help="sample rate of the input and output videos")
-parser.add_argument('--frame_rate', type=float, default=30,
-                    help="frame rate of the input and output videos. optional... I try to find it out myself, but it doesn't always work.")
-parser.add_argument('--frame_quality', type=int, default=3,
-                    help="quality of frames to be extracted from input video. 1 is highest, 31 is lowest, 3 is the default.")
+def parse_arguments():
+    parser = ArgumentParser(
+            description='Modifies a video file to play at different speeds when there is sound vs. silence.')
 
-args = parser.parse_args()
+    source = parser.add_mutually_exclusive_group(required=True)
 
-frameRate = args.frame_rate
-SAMPLE_RATE = args.sample_rate
-SILENT_THRESHOLD = args.silent_threshold
-FRAME_SPREADAGE = args.frame_margin
-NEW_SPEED = [args.silent_speed, args.sounded_speed]
-if args.url is not None:
-    INPUT_FILE = download_file(args.url)
-else:
-    INPUT_FILE = args.input_file
-URL = args.url
-FRAME_QUALITY = args.frame_quality
+    source.add_argument('--input_file', type=str, help='the video file you want modified')
+    source.add_argument('--url', type=str, help='A youtube url to download and process')
 
-assert INPUT_FILE is not None, "why u put no input file, that dum"
+    parser.add_argument('--output_file', type=str, default="",
+                        help="the output file. (optional. if not included, it'll just modify the input file name)")
 
-if len(args.output_file) >= 1:
-    OUTPUT_FILE = args.output_file
-else:
-    OUTPUT_FILE = input_to_output_filename(INPUT_FILE)
+    # Cutter Options
+    parser.add_argument('--silent_threshold', type=float, default=0.03,
+                        help="the volume amount that frames' audio needs to surpass to be consider \"sounded\". It ranges from 0 (silence) to 1 (max volume)")
 
-TEMP_FOLDER = "TEMP"
-AUDIO_FADE_ENVELOPE_SIZE = 400  # smooth out transitiion's audio by quickly fading in/out (arbitrary magic number whatever)
+    parser.add_argument('--sounded_speed', type=float, default=1.00,
+                        help="the speed that sounded (spoken) frames should be played at. Typically 1.")
 
-create_path(TEMP_FOLDER)
+    parser.add_argument('--silent_speed', type=float, default=5.00,
+                        help="the speed that silent frames should be played at. 999999 for jumpcutting.")
 
-command = "ffmpeg -i " + INPUT_FILE + " -qscale:v " + str(
-    FRAME_QUALITY) + " " + TEMP_FOLDER + "/frame%06d.jpg -hide_banner"
-subprocess.call(command, shell=True)
+    parser.add_argument('--frame_margin', type=float, default=1,
+                        help="some silent frames adjacent to sounded frames are included to provide context. How many frames on either the side of speech should be included? That's this variable.")
 
-command = "ffmpeg -i " + INPUT_FILE + " -ab 160k -ac 2 -ar " + str(SAMPLE_RATE) + " -vn " + TEMP_FOLDER + "/audio.wav"
+    # Quality Options
+    parser.add_argument('--sample_rate', type=float, default=44100, help="sample rate of the input and output videos")
 
-subprocess.call(command, shell=True)
+    parser.add_argument('--frame_rate', type=float, default=30,
+                        help="frame rate of the input and output videos. optional... I try to find it out myself, but it doesn't always work.")
 
-command = "ffmpeg -i " + TEMP_FOLDER + "/input.mp4 2>&1"
-f = open(TEMP_FOLDER + "/params.txt", "w")
-subprocess.call(command, shell=True, stdout=f)
+    parser.add_argument('--frame_quality', type=int, default=3,
+                        help="quality of frames to be extracted from input video. 1 is highest, 31 is lowest, 3 is the default.")
 
-sampleRate, audioData = wavfile.read(TEMP_FOLDER + "/audio.wav")
-audioSampleCount = audioData.shape[0]
-maxAudioVolume = get_max_volume(audioData)
+    return parser.parse_args()
 
-f = open(TEMP_FOLDER + "/params.txt", 'r+')
-pre_params = f.read()
-f.close()
-params = pre_params.split('\n')
-for line in params:
-    m = re.search('Stream #.*Video.* ([0-9]*) fps', line)
-    if m is not None:
-        frameRate = float(m.group(1))
 
-samplesPerFrame = sampleRate / frameRate
+def main():
+    args = parse_arguments()
 
-audioFrameCount = int(math.ceil(audioSampleCount / samplesPerFrame))
+    frame_rate = args.frame_rate
+    sample_rate = args.sample_rate
+    silent_threshold = args.silent_threshold
+    frame_spread = args.frame_margin
+    new_speed = [args.silent_speed, args.sounded_speed]
 
-hasLoudAudio = np.zeros(audioFrameCount)
-
-for i in range(audioFrameCount):
-    start = int(i * samplesPerFrame)
-    end = min(int((i + 1) * samplesPerFrame), audioSampleCount)
-    audiochunks = audioData[start:end]
-    maxchunksVolume = float(get_max_volume(audiochunks)) / maxAudioVolume
-    if maxchunksVolume >= SILENT_THRESHOLD:
-        hasLoudAudio[i] = 1
-
-chunks = [[0, 0, 0]]
-shouldIncludeFrame = np.zeros(audioFrameCount)
-for i in range(audioFrameCount):
-    start = int(max(0, i - FRAME_SPREADAGE))
-    end = int(min(audioFrameCount, i + 1 + FRAME_SPREADAGE))
-    shouldIncludeFrame[i] = np.max(hasLoudAudio[start:end])
-    if i >= 1 and shouldIncludeFrame[i] != shouldIncludeFrame[i - 1]:  # Did we flip?
-        chunks.append([chunks[-1][1], i, shouldIncludeFrame[i - 1]])
-
-chunks.append([chunks[-1][1], audioFrameCount, shouldIncludeFrame[i - 1]])
-chunks = chunks[1:]
-
-outputAudioData = np.zeros((0, audioData.shape[1]))
-outputPointer = 0
-
-lastExistingFrame = None
-for chunk in chunks:
-    audioChunk = audioData[int(chunk[0] * samplesPerFrame):int(chunk[1] * samplesPerFrame)]
-
-    sFile = TEMP_FOLDER + "/tempStart.wav"
-    eFile = TEMP_FOLDER + "/tempEnd.wav"
-    wavfile.write(sFile, SAMPLE_RATE, audioChunk)
-    with WavReader(sFile) as reader:
-        with WavWriter(eFile, reader.channels, reader.samplerate) as writer:
-            tsm = phasevocoder(reader.channels, speed=NEW_SPEED[int(chunk[2])])
-            tsm.run(reader, writer)
-    _, alteredAudioData = wavfile.read(eFile)
-    length = alteredAudioData.shape[0]
-    endPointer = outputPointer + length
-    outputAudioData = np.concatenate((outputAudioData, alteredAudioData / maxAudioVolume))
-
-    # outputAudioData[outputPointer:endPointer] = alteredAudioData/maxAudioVolume
-
-    # smooth out transition audio by quickly fading in/out
-
-    if length < AUDIO_FADE_ENVELOPE_SIZE:
-        outputAudioData[outputPointer:endPointer] = 0  # audio is less than 0.01 sec, let's just remove it.
+    if args.url is not None:
+        input_file = download_file(args.url)
     else:
-        pre_mask = np.arange(AUDIO_FADE_ENVELOPE_SIZE) / AUDIO_FADE_ENVELOPE_SIZE
-        mask = np.repeat(pre_mask[:, np.newaxis], 2, axis=1)  # make the fade-envelope mask stereo
-        outputAudioData[outputPointer:outputPointer + AUDIO_FADE_ENVELOPE_SIZE] *= mask
-        outputAudioData[endPointer - AUDIO_FADE_ENVELOPE_SIZE:endPointer] *= 1 - mask
+        input_file = args.input_file
 
-    startOutputFrame = int(math.ceil(outputPointer / samplesPerFrame))
-    endOutputFrame = int(math.ceil(endPointer / samplesPerFrame))
-    for outputFrame in range(startOutputFrame, endOutputFrame):
-        inputFrame = int(chunk[0] + NEW_SPEED[int(chunk[2])] * (outputFrame - startOutputFrame))
-        didItWork = copy_frame(inputFrame, outputFrame)
-        if didItWork:
-            lastExistingFrame = inputFrame
+    frame_quality = args.frame_quality
+
+    assert input_file is not None, "why u put no input file, that dum"
+
+    if len(args.output_file) >= 1:
+        output_file = args.output_file
+    else:
+        output_file = input_to_output_filename(input_file)
+
+    temp_folder = "TEMP"
+    audio_fade_envelope_size = 400  # smooth out transition audio by quickly fading in/out (arbitrary magic number whatever)
+
+    create_path(temp_folder)
+
+    command = "ffmpeg -i " + input_file + " -qscale:v " + str(
+            frame_quality) + " " + temp_folder + "/frame%06d.jpg -hide_banner"
+    call(command, shell=True)
+
+    command = "ffmpeg -i " + input_file + " -ab 160k -ac 2 -ar " + str(
+            sample_rate) + " -vn " + temp_folder + "/audio.wav"
+
+    call(command, shell=True)
+
+    command = "ffmpeg -i " + temp_folder + "/input.mp4 2>&1"
+    f = open(temp_folder + "/params.txt", "w")
+    call(command, shell=True, stdout=f)
+
+    sample_rate, audio_data = wavfile.read(temp_folder + "/audio.wav")
+    audio_sample_count = audio_data.shape[0]
+    max_audio_volume = get_max_volume(audio_data)
+
+    f = open(temp_folder + "/params.txt", 'r+')
+    pre_params = f.read()
+    f.close()
+    params = pre_params.split('\n')
+    for line in params:
+        m = search('Stream #.*Video.* ([0-9]*) fps', line)
+        if m is not None:
+            frame_rate = float(m.group(1))
+
+    samples_per_frame = sample_rate / frame_rate
+
+    audio_frame_count = int(ceil(audio_sample_count / samples_per_frame))
+
+    has_loud_audio = np.zeros(audio_frame_count)
+
+    for i in range(audio_frame_count):
+        start = int(i * samples_per_frame)
+        end = min(int((i + 1) * samples_per_frame), audio_sample_count)
+        audio_chunks = audio_data[start:end]
+        max_chunks_volume = float(get_max_volume(audio_chunks)) / max_audio_volume
+        if max_chunks_volume >= silent_threshold:
+            has_loud_audio[i] = 1
+
+    chunks = [[0, 0, 0]]
+    should_include_frame = np.zeros(audio_frame_count)
+    for i in range(audio_frame_count):
+        start = int(max(0, i - frame_spread))
+        end = int(min(audio_frame_count, i + 1 + frame_spread))
+        should_include_frame[i] = np.max(has_loud_audio[start:end])
+        if i >= 1 and should_include_frame[i] != should_include_frame[i - 1]:  # Did we flip?
+            chunks.append([chunks[-1][1], i, should_include_frame[i - 1]])
+
+    chunks.append([chunks[-1][1], audio_frame_count, should_include_frame[i - 1]])
+    chunks = chunks[1:]
+
+    output_audio_data = np.zeros((0, audio_data.shape[1]))
+    output_pointer = 0
+
+    last_existing_frame = None
+    for chunk in chunks:
+        audio_chunk = audio_data[int(chunk[0] * samples_per_frame):int(chunk[1] * samples_per_frame)]
+
+        s_file = temp_folder + "/tempStart.wav"
+        e_file = temp_folder + "/tempEnd.wav"
+        wavfile.write(s_file, sample_rate, audio_chunk)
+        with WavReader(s_file) as reader:
+            with WavWriter(e_file, reader.channels, reader.samplerate) as writer:
+                tsm = phasevocoder(reader.channels, speed=new_speed[int(chunk[2])])
+                tsm.run(reader, writer)
+
+        _, altered_audio_data = wavfile.read(e_file)
+        length = altered_audio_data.shape[0]
+        end_pointer = output_pointer + length
+        output_audio_data = np.concatenate((output_audio_data, altered_audio_data / max_audio_volume))
+
+        # output_audio_data[output_pointer:end_pointer] = altered_audio_data/max_audio_volume
+
+        # smooth out transition audio by quickly fading in/out
+
+        if length < audio_fade_envelope_size:
+            output_audio_data[output_pointer:end_pointer] = 0  # audio is less than 0.01 sec, let's just remove it.
         else:
-            copy_frame(lastExistingFrame, outputFrame)
+            pre_mask = np.arange(audio_fade_envelope_size) / audio_fade_envelope_size
+            mask = np.repeat(pre_mask[:, np.newaxis], 2, axis=1)  # make the fade-envelope mask stereo
+            output_audio_data[output_pointer:output_pointer + audio_fade_envelope_size] *= mask
+            output_audio_data[end_pointer - audio_fade_envelope_size:end_pointer] *= 1 - mask
 
-    outputPointer = endPointer
+        start_output_frame = int(ceil(output_pointer / samples_per_frame))
+        end_output_frame = int(ceil(end_pointer / samples_per_frame))
+        for outputFrame in range(start_output_frame, end_output_frame):
+            input_frame = int(chunk[0] + new_speed[int(chunk[2])] * (outputFrame - start_output_frame))
+            did_it_work = copy_frame(input_frame, outputFrame)
+            if did_it_work:
+                last_existing_frame = input_frame
+            else:
+                copy_frame(last_existing_frame, outputFrame)
 
-wavfile.write(TEMP_FOLDER + "/audioNew.wav", SAMPLE_RATE, outputAudioData)
+        output_pointer = end_pointer
 
-'''
-outputFrame = math.ceil(outputPointer/samplesPerFrame)
-for endGap in range(outputFrame,audioFrameCount):
-    copyFrame(int(audioSampleCount/samplesPerFrame)-1,endGap)
-'''
+    wavfile.write(temp_folder + "/audioNew.wav", sample_rate, output_audio_data)
 
-command = "ffmpeg -framerate " + str(
-    frameRate) + " -i " + TEMP_FOLDER + "/newFrame%06d.jpg -i " + TEMP_FOLDER + "/audioNew.wav -strict -2 " + OUTPUT_FILE
-subprocess.call(command, shell=True)
+    '''
+    outputFrame = math.ceil(output_pointer/samples_per_frame)
+    for endGap in range(outputFrame,audio_frame_count):
+        copyFrame(int(audioSampleCount/samples_per_frame)-1,endGap)
+    '''
 
-delete_path(TEMP_FOLDER)
+    command = "ffmpeg -framerate " + str(
+            frame_rate) + " -i " + temp_folder + "/newFrame%06d.jpg -i " + temp_folder + "/audioNew.wav -strict -2 " + output_file
+    call(command, shell=True)
+
+    delete_path(temp_folder)
+
+
+if __name__ == '__main__':
+    main()
